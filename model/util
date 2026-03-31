@@ -1,0 +1,109 @@
+import torch
+import torch.nn as nn
+import numpy as np
+import torch.nn.functional as F
+
+def sigmoid_rampup(current, rampup_length):
+    """Exponential rampup for consistency weighting."""
+    if rampup_length == 0:
+        return 1.0
+    else:
+        current = np.clip(current, 0.0, rampup_length)
+        phase = 1.0 - current / rampup_length
+        return float(np.exp(-5.0 * phase * phase))
+
+
+def linear_rampup(current, rampup_length):
+    """Linear rampup for consistency weighting."""
+    assert current >= 0 and rampup_length >= 0
+    if current >= rampup_length:
+        return 1.0
+    else:
+        return current / rampup_length
+
+
+def cosine_rampdown(current, rampdown_length):
+    """Cosine rampdown function."""
+    assert 0 <= current <= rampdown_length
+    return float(.5 * (np.cos(np.pi * current / rampdown_length) + 1))
+
+
+def get_current_consistency_weight(epoch, consistency, rampup_length):
+    """
+    Compute consistency weight using sigmoid ramp-up schedule.
+    """
+    return consistency * sigmoid_rampup(epoch, rampup_length)
+
+
+def update_ema_variables(model, ema_model, alpha, global_step):
+    """
+    Update EMA (teacher) model parameters using exponential moving average.
+    Uses true average during early steps for better stability.
+    """
+    alpha = min(1.0 - 1.0 / (global_step + 1.0), alpha)
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data.mul_(alpha).add_(param.data, alpha=1.0 - alpha)
+
+def update_variance(pred1, pred2, targets):
+    """
+    Calculate pseudo-label refinement based on KL divergence.
+    """
+    sm = nn.Softmax(dim=1)
+    log_sm = nn.LogSoftmax(dim=1)
+    kl_distance = nn.KLDivLoss(reduction='none')
+    loss_kl = torch.sum(kl_distance(log_sm(pred1), sm(pred2)), dim=1)
+    exp_loss_kl = torch.exp(-loss_kl)
+    pseudo_label_rect = targets * exp_loss_kl
+    return pseudo_label_rect, loss_kl
+
+def update_consistency_loss(student_logits, teacher_logits):
+    """
+    Standard mean squared error consistency loss between student and teacher.
+    """
+    return torch.mean((student_logits - teacher_logits) ** 2)
+
+
+def compute_kl_variance(student_logits, teacher_logits):
+    """
+    Calculate pixel-wise variance using KL divergence for uncertainty estimation.
+    """
+    log_p = torch.log_softmax(student_logits, dim=1)
+    q = torch.softmax(teacher_logits, dim=1)
+    kl_map = torch.sum(q * (torch.log(q + 1e-8) - log_p), dim=1)
+    return kl_map
+
+
+def apply_uncertainty_weight(loss_map, kl_map):
+    """
+    Apply uncertainty-aware weighting to the loss map using exponential suppression.
+    """
+    weight = torch.exp(-kl_map)
+    return torch.mean(loss_map * weight)
+
+
+def compute_image_level_kl(student_logits, teacher_logits):
+    """
+    Calculate image-level KL divergence score for sample selection.
+    
+    Args:
+        student_logits: shape (B, C, H, W)
+        teacher_logits: shape (B, C, H, W)
+    Returns:
+        d_x: shape (B,), average KL score per image.
+    """
+    # Convert logits to probability distributions
+    p_student = F.softmax(student_logits, dim=1)
+    p_teacher = F.softmax(teacher_logits, dim=1)
+
+    epsilon = 1e-8  
+
+    # Pixel-wise KL divergence for each class: F_T * (log F_T - log F_S)
+    kl_pixel_class = p_teacher * (torch.log(p_teacher + epsilon) - torch.log(p_student + epsilon))
+
+    # Sum across classes (dim=1)
+    kl_sum_classes = torch.sum(kl_pixel_class, dim=1)  # (B, H, W)
+
+    # Average across spatial dimensions (dim=1, 2)
+    d_x = torch.mean(kl_sum_classes, dim=(1, 2))  # (B,)
+
+    return d_x
