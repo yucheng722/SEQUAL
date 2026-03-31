@@ -1,0 +1,181 @@
+import os
+import sys
+import logging
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from tqdm import tqdm
+from tensorboardX import SummaryWriter
+import numpy as np
+import pandas as pd
+import cv2
+import train.losses as losses
+from model.stopping_criteria import update_iou_stat, compute_iou, if_update
+from model.util import (
+    get_current_consistency_weight,
+    update_consistency_loss,
+    update_ema_variables
+)
+from train.validate import validation
+from dataset.load_data import get_data
+
+
+def Active_Learning_train(
+        args,
+        train_loader,
+        unlabeled_loader,
+        test_loader,
+        AL_time,
+        Rect,
+        model,
+        ema_model,
+        beat_sup_metrics
+):
+    # ================== Initialization ==================
+    iter_num = 0
+    best_performance = 0.0
+    updated = False
+
+    # ================== Optimizer Setup ==================
+    optimizer = optim.SGD(
+        model.parameters(),
+        lr=args.base_lr,
+        momentum=0.9,
+        weight_decay=1e-4
+    )
+
+    max_iter = args.max_iterations
+    max_epoch = max_iter // len(train_loader)
+
+    # ================== Logging Setup ==================
+    writer = SummaryWriter(os.path.join(args.root_path, 'log'))
+    logging.info(f"Starting AL Step {AL_time}: {len(train_loader)} iterations per epoch")
+
+    # ================== Main Training Loop ==================
+    iterator = tqdm(range(0, max_epoch), ncols=70)
+    mIoU_history = []
+
+    for epoch_num in iterator:
+        # Reset epoch statistics
+        TP_epoch = [0, 0]
+        P_epoch = [0, 0]
+        T_epoch = [0, 0]
+
+        # -------------------- Batch Iteration --------------------
+        for i_batch, (lb_batch, ulb_batch) in enumerate(zip(train_loader, unlabeled_loader)):
+
+            # Combine labeled and unlabeled images for consistency learning
+            img_batch = torch.cat(
+                (lb_batch['image'].float(), ulb_batch['image'].float()),
+                dim=0
+            ).cuda()
+
+            label_batch = lb_batch['label_pseudo'].long().cuda()
+            label_b = label_batch.shape[0]
+
+            # Forward pass (Student model)
+            outputs = model(img_batch)
+            outputs_soft = torch.softmax(outputs, dim=1)
+            preds = torch.argmax(outputs_soft, dim=1).unsqueeze(1)
+
+            # Forward pass (Teacher/EMA model)
+            with torch.no_grad():
+                ema_outputs = ema_model(img_batch)
+
+            # Accumulate IoU statistics for the labeled subset
+            TP_epoch, P_epoch, T_epoch = update_iou_stat(
+                preds[:label_b].squeeze(1).cpu().numpy(),
+                label_batch.cpu().numpy(),
+                TP_epoch, P_epoch, T_epoch
+            )
+
+            # Supervised Loss (Cross Entropy)
+            loss_ce = F.cross_entropy(outputs[:label_b], label_batch)
+            supervised_loss = loss_ce
+
+            # Consistency Regularization (Semi-supervised)
+            consistency_weight = get_current_consistency_weight(
+                iter_num // 150,
+                args.consistency,
+                args.consistency_rampup
+            )
+            consistency_loss = losses.softmax_mse_loss(outputs, ema_outputs)
+
+            # Total Loss
+            loss = supervised_loss + consistency_weight * consistency_loss
+
+            # Optimization step
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 20)
+            optimizer.step()
+
+            # Update Teacher model using Exponential Moving Average
+            update_ema_variables(model, ema_model, args.ema_decay, iter_num)
+
+            # Polynomial Learning Rate Decay
+            lr = args.base_lr * (1 - iter_num / max_iter) ** 0.9
+            for g in optimizer.param_groups:
+                g['lr'] = lr
+
+            iter_num += 1
+
+            if iter_num % 50 == 0:
+                logging.info(f"Step {iter_num} | Total Loss: {loss.item():.4f}")
+
+        # -------------------- End of Batch Iteration --------------------
+
+        # ==========================================================
+        # Stopping Criterion Evaluation (Executed per Epoch)
+        # ==========================================================
+        IoU_epoch = compute_iou(TP_epoch, P_epoch, T_epoch)
+        mIoU_current = np.mean(IoU_epoch)
+        mIoU_history.append(mIoU_current)
+
+        # Trigger stopping condition after a specific warm-up period (K1)
+        if AL_time <= args.Max_AL_iter and Rect and not updated and epoch_num > args.K1:
+
+            # Evaluate trend using second-order derivative approximation
+            is_stable, acceleration = if_update(np.array(mIoU_history), epoch_num, args.stopping_threshold)
+
+            if is_stable:  # Acceleration falls below threshold tau
+                model.eval()
+                ema_model.eval()
+
+                # Perform Pseudo-Label Refinement on the labeled training set
+                for idx in range(len(train_loader.dataset.data_path)):
+                    img, _, _, _ = get_data(train_loader.dataset.data_path[idx])
+                    img = img.float().cuda()
+
+                    with torch.no_grad():
+                        ema_out = ema_model(img.unsqueeze(0))
+                        soft = torch.softmax(ema_out, dim=1)
+                        pred = torch.argmax(soft, dim=1).unsqueeze(1).cpu()
+
+                    # Update internal dataset pseudo labels
+                    train_loader.dataset.update_pseudo_labels(idx, [0, 1], soft, pred, args.correct_save_path, 0.8)
+
+                updated = True
+                logging.info(f"\nConvergence detected at Epoch {epoch_num}. Refinement complete.")
+                break  # Terminate current AL training round
+
+    # ================== Final Validation Phase ==================
+    logging.info("Running final evaluation on the test set...")
+    dice, iou, asd, hd, _ = validation(test_loader, ema_model)
+
+    logging.info(f"========== AL Stage {AL_time} Metrics ==========")
+    logging.info(f"  Dice Score : {dice * 100:.2f} %")
+    logging.info(f"  Mean IoU   : {iou * 100:.2f} %")
+    logging.info(f"  ASD        : {asd:.4f} mm")
+    logging.info(f"  95% HD     : {hd:.4f} mm")
+    logging.info("=================================================")
+
+    # Save model checkpoint
+    best_performance = dice
+    save_name = f'AL_{AL_time}_dice_{dice:.4f}_iou_{iou:.4f}_asd_{asd:.4f}_hd_{hd:.4f}.pth'
+    torch.save(model.state_dict(), os.path.join(args.root_path, save_name))
+    logging.info(f"Model serialized as: {save_name}\n")
+
+    beat_sup_metrics.append(best_performance)
+    return model, ema_model
