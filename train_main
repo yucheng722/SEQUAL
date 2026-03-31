@@ -1,0 +1,162 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+import sys
+import time
+import torch
+import argparse
+import numpy as np
+from torch.utils.data import DataLoader
+import segmentation_models_pytorch as smp
+from pylab import *
+
+from train.train_AL import Active_Learning_train
+from dataset.load_data import DataLoad
+import train.query_stg
+
+
+def get_args():
+    """
+    All hyper-parameters and configurations are defined here
+    """
+    args = argparse.Namespace()
+
+    # ================== Path settings ==================
+    args.root_path = '/path/to/data/h5_files'
+    args.correct_save_path = '/path/to/project/saved_correct/'
+
+    # ================== Training settings ==================
+    args.num_classes = 2
+    args.max_iterations = 1500
+    args.Max_AL_iter = 5                # Maximum number of active learning rounds
+    args.label_size = 200               # Number of samples added per AL iteration
+    args.batch_size = 14
+    args.labeled_bs = 6                 # Batch size for labeled data
+    args.batch_size_test = 6
+    args.base_lr = 0.01
+    args.seed = 9999
+
+    # ================== Semi-supervised settings ==================
+    args.ema = True
+    args.ema_decay = 0.9
+    args.consistency_type = 'mse'
+    args.consistency = 1.0
+    args.consistency_rampup = 40.0
+
+    # ================== Pseudo-label settings ==================
+    args.T = 1                          # Number of forward passes
+    args.threshold_pseudo = 0.8         # Confidence threshold for pseudo labels
+    args.stopping_threshold = 0.05
+    args.K1 = 2
+    args.pseudo = True
+    args.pseudo_rect = True             # Whether to refine pseudo labels using EMA model
+
+    # ================== Data settings ==================
+    args.patch_size = [128, 256]
+
+    return args
+
+
+if __name__ == '__main__':
+
+    # ================== Environment setup ==================
+    torch.cuda.set_device(0)
+    torch.backends.cudnn.enabled = True
+    torch.backends.cudnn.benchmark = True
+
+    args = get_args()
+
+    Time = []
+    beat_sup_metrics = []
+
+    # ================== Dataset ==================
+    train_dataset, test_dataset, unlabeled_dataset,_ = DataLoad(args.root_path, True)
+
+    test_loader = DataLoader(
+        dataset=test_dataset,
+        batch_size=args.batch_size_test,
+        num_workers=0,
+        pin_memory=False
+    )
+
+    # ================== Model ==================
+    model = smp.UnetPlusPlus(
+        encoder_name='resnet50',
+        encoder_depth=4,
+        encoder_weights='imagenet',
+        decoder_use_batchnorm=True,
+        decoder_channels=[128, 64, 32, 16],
+        in_channels=1,
+        classes=args.num_classes,
+        activation=None
+    ).cuda()
+
+    ema_model = smp.UnetPlusPlus(
+        encoder_name='resnet50',
+        encoder_depth=4,
+        encoder_weights='imagenet',
+        decoder_use_batchnorm=True,
+        decoder_channels=[128, 64, 32, 16],
+        in_channels=1,
+        classes=args.num_classes,
+        activation=None
+    ).cuda()
+
+    # Detach EMA model parameters (teacher model)
+    for param in ema_model.parameters():
+        param.detach_()
+
+    # ================== Active Learning Loop ==================
+    for AL_time in range(args.Max_AL_iter):
+
+        train_loader = DataLoader(
+            dataset=train_dataset,
+            batch_size=args.labeled_bs,
+            num_workers=0,
+            pin_memory=False
+        )
+
+        unlabeled_loader = DataLoader(
+            dataset=unlabeled_dataset,
+            batch_size=args.batch_size - args.labeled_bs,
+            num_workers=0,
+            pin_memory=False
+        )
+
+        start_time = time.time()
+
+        model, ema_model = Active_Learning_train(
+            args,
+            train_loader,
+            unlabeled_loader,
+            test_loader,
+            AL_time,
+            True,
+            model,
+            ema_model,
+            beat_sup_metrics
+        )
+
+        end_time = time.time()
+        Time.append(round(end_time - start_time, 2))
+
+        # ================== Query and update dataset ==================
+        if AL_time != args.Max_AL_iter:
+            query_method = 'KL'
+            unlabeled_list = unlabeled_loader.dataset.data_path
+
+            chosen = train.query_stg.Query(
+                model,
+                ema_model,
+                unlabeled_dataset,
+                train_dataset,
+                args.patch_size,
+                args.label_size,
+                query_method,
+                dropout=False
+            )
+
+            train_dataset.update_dict(chosen, unlabeled_list)
+            unlabeled_dataset.delete_dict(chosen)
+            args.labeled_bs += 1
+
+    print(Time)
