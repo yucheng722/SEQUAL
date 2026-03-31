@@ -1,0 +1,246 @@
+import os
+import random
+import shutil
+import torch
+from torch.utils.data import Dataset
+import numpy as np
+import cv2
+
+# ================== PATH CONFIGURATION ==================
+# Generic path setup
+BASE_DIR = os.getenv("PROJECT_DATA_ROOT", "./data_root")
+PATCH_DIR = os.path.join(BASE_DIR, "patches")
+PSE_DIR = os.path.join(BASE_DIR, "pseudo_labels")
+LIST_DIR = os.path.join(BASE_DIR, "file_lists")
+CF_DIR = os.path.join(BASE_DIR, "calibration")
+
+def create_splits():
+    """
+    Splits the dataset into Train, Test, Val, and Unlabeled pools based on criteria.
+    Ensures no overlap between cases.
+    """
+    train_txt = os.path.join(LIST_DIR, "train.txt")
+    if os.path.exists(train_txt):
+        return  
+
+    def read_list(filename):
+        filepath = os.path.join(LIST_DIR, filename)
+        if not os.path.exists(filepath):
+            return []
+        with open(filepath, 'r') as f:
+            return [line.strip() for line in f if line.strip()]
+
+    # Load predefined quality lists
+    list_3 = read_list("category_3.txt")
+    list_2 = read_list("category_2.txt")
+    list_1 = read_list("category_1.txt")
+    list_0 = read_list("category_0.txt")
+
+    # 1. Test Split: All from category 3 + sample from category 2
+    test_cases = list(list_3)
+    test_from_2 = random.sample(list_2, min(23, len(list_2)))
+    test_cases.extend(test_from_2)
+    list_2_rem = [c for c in list_2 if c not in test_from_2]
+
+    # 2. Train Split: Sample from category 1 and category 2
+    train_from_1 = random.sample(list_1, min(40, len(list_1)))
+    train_from_2 = random.sample(list_2_rem, min(10, len(list_2_rem)))
+    train_cases = train_from_1 + train_from_2
+
+    list_1_rem = [c for c in list_1 if c not in train_from_1]
+    list_2_rem = [c for c in list_2_rem if c not in train_from_2]
+
+    # 3. Unlabeled Split: Random selection from the remaining pool
+    pool_remaining = list_0 + list_1_rem + list_2_rem
+    unlabeled_cases = random.sample(pool_remaining, min(625, len(pool_remaining)))
+
+    # 4. Validation Split: Everything left in the pool
+    unlabeled_set = set(unlabeled_cases)
+    val_cases = [c for c in pool_remaining if c not in unlabeled_set]
+
+    templates = ['type_a', 'type_b', 'type_c']
+
+    def write_patches(cases, out_name):
+        with open(os.path.join(LIST_DIR, out_name), 'w') as f:
+            for case in cases:
+                for tmpl in templates:
+                    # Check for bilateral existence
+                    base_l = f"{case}_side_l_{tmpl}"
+                    base_r = f"{case}_side_r_{tmpl}"
+                    if os.path.exists(os.path.join(PATCH_DIR, f"{base_l}_img.png")):
+                        f.write(f"{base_l}\n")
+                    elif os.path.exists(os.path.join(PATCH_DIR, f"{base_r}_img.png")):
+                        f.write(f"{base_r}\n")
+
+    write_patches(train_cases, "train.txt")
+    write_patches(test_cases, "test.txt")
+    write_patches(unlabeled_cases, "unlabeled.txt")
+    write_patches(val_cases, "val.txt")
+
+    print(f"Data partitioning complete.")
+    print(f"Stats: Train={len(train_cases)}, Test={len(test_cases)}, Unlabeled={len(unlabeled_cases)}, Val={len(val_cases)}")
+
+def get_data(patch_name):
+    img_path = os.path.join(PATCH_DIR, f"{patch_name}_img.png")
+    mask_path = os.path.join(PATCH_DIR, f"{patch_name}_mask.png")
+
+    image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    label = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+
+    # Initialize pseudo label as the base label
+    label_pseudo = label.copy()
+
+    image = np.array(image).astype(np.float32)[np.newaxis, ...]
+    label = (label > 0).astype(np.uint8)
+    label_pseudo = (label_pseudo > 0).astype(np.uint8)
+
+    # Metadata processing (e.g., calibration factors)
+    cf_path = os.path.join(PATCH_DIR, f"{patch_name}_meta.txt")
+    cf_y, cf_x = 0.064, 0.064
+    if os.path.exists(cf_path):
+        with open(cf_path, 'r') as f:
+            content = f.read().strip().split(',')
+            if len(content) == 2:
+                cf_y, cf_x = float(content[0]), float(content[1])
+
+    return (torch.from_numpy(image),
+            torch.from_numpy(label).long(),
+            torch.from_numpy(label_pseudo).long(),
+            (cf_y, cf_x))
+
+class FullDataset(Dataset):
+    def __init__(self, root_path, init_dict, subset='Train', transform=None):
+        self.transform = transform
+        self.subset = subset
+
+        create_splits()
+
+        mapping = {
+            'Train': 'train.txt',
+            'Test': 'test.txt',
+            'Unlabel': 'unlabeled.txt',
+            'Val': 'val.txt'
+        }
+        list_file = mapping.get(subset, 'train.txt')
+        list_path = os.path.join(LIST_DIR, list_file)
+        
+        with open(list_path, 'r') as f:
+            self.dir_list = [line.strip() for line in f if line.strip()]
+
+        self.data_path = []
+        self.update_counts = []
+        self.pseudo_cache = {}
+
+        if init_dict:
+            self.init_data_structures()
+
+    def __getitem__(self, index):
+        patch_name = self.data_path[index]
+        img, label, label_pseudo_disk, cf = get_data(patch_name)
+
+        # Priority: Memory cache > Disk
+        if patch_name in self.pseudo_cache:
+            label_pseudo = self.pseudo_cache[patch_name]
+        else:
+            label_pseudo = label_pseudo_disk
+            self.pseudo_cache[patch_name] = label_pseudo.clone()
+
+        sample = {
+            'image': img,
+            'label': label,
+            'label_pseudo': label_pseudo,
+            'meta': cf,
+            'idx': index
+        }
+        if self.transform:
+            sample = self.transform(sample)
+        return sample
+
+    def __len__(self):
+        return len(self.data_path)
+
+    def init_data_structures(self):
+        for patch_name in self.dir_list:
+            self.update_counts.append(0)
+            self.data_path.append(patch_name)
+
+    def update_pool(self, chosen_indices, path_list):
+        for idx in chosen_indices:
+            self.data_path.append(path_list[idx])
+            self.update_counts.append(0)
+
+    def remove_from_pool(self, chosen_indices):
+        chosen_indices.sort()
+        for index in chosen_indices[::-1]:
+            del self.data_path[index]
+
+    def update_pseudo_labels(self, idx, valid_mask_idx, soft_outputs, hard_output, save_path, threshold=0.8):
+        if self.update_counts[idx] <= 100:
+            self._refine_labels(
+                idx, valid_mask_idx, soft_outputs, hard_output, save_path,
+                threshold, mode='single', use_constraint=True
+            )
+            self.update_counts[idx] += 1
+
+    def _refine_labels(self, idx, valid_mask_idx, soft_outputs, hard_output, save_path,
+                        threshold, mode, use_constraint=True):
+        patch_name = self.data_path[idx]
+        _, label_gt, _, _ = get_data(patch_name)
+
+        if patch_name not in self.pseudo_cache:
+            _, _, label_p_disk, _ = get_data(patch_name)
+            self.pseudo_cache[patch_name] = label_p_disk.clone()
+        
+        current_pseudo = self.pseudo_cache[patch_name].clone()
+        h, w = current_pseudo.size()
+        
+        pred_argmax = hard_output
+        pred_max_prob = soft_outputs.max(axis=1)[0]
+
+        # Consistency check for binary classes
+        if use_constraint:
+            for b_idx in range(1):
+                unique_vals = torch.unique(current_pseudo)
+                mask_accum = torch.zeros((h, w), dtype=torch.long)
+                for val in unique_vals:
+                    mask_accum = mask_accum | (pred_argmax[b_idx] == val)
+                pred_argmax[b_idx][mask_accum == 0] = 1
+
+        current_pseudo = current_pseudo.cpu()
+        pred_argmax = pred_argmax.cpu()
+        pred_max_prob = pred_max_prob.cpu()
+
+        # Identify pixels to update based on model confidence
+        change_mask = (current_pseudo != pred_argmax) & (pred_max_prob > threshold)
+
+        if mode == 'single':
+            class_mask = torch.zeros((1, h, w), dtype=torch.bool)
+            for val in valid_mask_idx:
+                class_mask = class_mask | (pred_argmax == val)
+            change_mask = change_mask & class_mask
+
+        # Safety check to prevent catastrophic forgetting/collapse
+        test_pseudo = current_pseudo.clone().unsqueeze(0).unsqueeze(0)
+        test_pseudo[change_mask] = pred_argmax[change_mask]
+        if torch.sum(test_pseudo != 0) < 0.5 * torch.sum(current_pseudo != 0):
+            return
+
+        # Apply updates
+        current_pseudo[change_mask.squeeze()] = pred_argmax[change_mask]
+        self.pseudo_cache[patch_name] = current_pseudo.clone()
+
+        # Debug visualization
+        os.makedirs(save_path, exist_ok=True)
+        export_mask = current_pseudo.cpu().numpy() * 255
+        export_intersect = (label_gt.cpu().numpy().astype(int) * current_pseudo.numpy().astype(int))
+        
+        cv2.imwrite(os.path.join(save_path, f"{patch_name}_upd_{self.update_counts[idx]}.png"), export_mask.astype(np.uint8))
+        cv2.imwrite(os.path.join(save_path, f"{patch_name}_dbg_{self.update_counts[idx]}.png"), export_intersect.astype(np.uint8))
+
+
+def DataLoad(root_path, init_flag):
+    train_ds = FullDataset(root_path, init_flag, subset='Train')
+    test_ds = FullDataset(root_path, init_flag, subset='Test')
+    unlabeled_ds = FullDataset(root_path, init_flag, subset='Unlabel')
+    val_ds = FullDataset(root_path, init_flag, subset='Val')
+    return train_ds, test_ds, unlabeled_ds, val_ds
