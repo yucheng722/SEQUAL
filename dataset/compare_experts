@@ -1,0 +1,83 @@
+import os
+import numpy as np
+import cv2
+from glob import glob
+
+def calculate_dice(mask_a, mask_b):
+    """Computes the Dice coefficient between two binary masks."""
+    mask_a = mask_a.astype(bool)
+    mask_b = mask_b.astype(bool)
+    intersection = np.logical_and(mask_a, mask_b)
+    return 2. * intersection.sum() / (mask_a.sum() + mask_b.sum() + 1e-8)
+
+def load_mask_collection(folder_path, id_length=11):
+    """Loads masks from a folder into a dictionary keyed by truncated filename."""
+    collection = {}
+    search_pattern = os.path.join(folder_path, '*')
+    for file_path in glob(search_pattern):
+        if not os.path.isfile(file_path):
+            continue
+        
+        # Extract unique identifier from filename
+        file_id = os.path.basename(file_path)[:id_length]
+        
+        # Load image in grayscale
+        img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
+        if img is None:
+            continue
+            
+        # Binarize mask
+        binary_mask = (img > 0).astype(np.uint8)
+        collection[file_id] = binary_mask
+    return collection
+
+def evaluate_metrics(source_map, target_map):
+    """Calculates mean and std Dice scores between two mask collections."""
+    scores = []
+    for uid, src_mask in source_map.items():
+        if uid in target_map:
+            tgt_mask = target_map[uid]
+            if src_mask.shape != tgt_mask.shape:
+                print(f"Warning: Dim mismatch for {uid}: {src_mask.shape} vs {tgt_mask.shape}")
+                continue
+            
+            score = calculate_dice(src_mask, tgt_mask)
+            scores.append(score)
+            
+    score_array = np.array(scores)
+    if len(score_array) == 0:
+        return 0.0, 0.0, 0
+        
+    return score_array.mean(), score_array.std(), len(score_array)
+
+if __name__ == "__main__":
+    # Configuration via environment or relative paths
+    DATA_ROOT = os.getenv('MASK_DATA_PATH', './data/processed_labels')
+    ID_SLICE = 11
+
+    # Define generic category mappings
+    sub_folders = {
+        "m_ref": os.path.join(DATA_ROOT, "ref_ensemble"),
+        "v1": os.path.join(DATA_ROOT, "annotator_1"),
+        "v1_alt": os.path.join(DATA_ROOT, "annotator_1_rev"),
+        "v2": os.path.join(DATA_ROOT, "annotator_2"),
+        "prediction": os.path.join(DATA_ROOT, "model_output")
+    }
+
+    print("Status: Loading mask data...")
+    data_sets = {key: load_mask_collection(path, ID_SLICE) for key, path in sub_folders.items()}
+
+    log_summary = " ".join([f"{k}: {len(v)}" for k, v in data_sets.items()])
+    print(f"Status: Data loaded -> {log_summary}")
+
+    print("\nStatus: Running cross-validation metrics...")
+    
+    # Example cross-comparisons between different annotators/versions
+    res_a_mean, res_a_std, count_a = evaluate_metrics(data_sets["v1"], data_sets["v1_alt"])
+    res_b_mean, res_b_std, count_b = evaluate_metrics(data_sets["v1"], data_sets["v2"])
+    res_c_mean, res_c_std, count_c = evaluate_metrics(data_sets["v1_alt"], data_sets["v2"])
+
+    print("\n--- Summary Report (Dice) ---")
+    print(f"Set_V1 vs Set_V1_Alt:  {res_a_mean:.4f} ± {res_a_std:.4f}  (n={count_a})")
+    print(f"Set_V1 vs Set_V2:      {res_b_mean:.4f} ± {res_b_std:.4f}  (n={count_b})")
+    print(f"Set_V1_Alt vs Set_V2:  {res_c_mean:.4f} ± {res_c_std:.4f}  (n={count_c})")
