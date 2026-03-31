@@ -1,0 +1,48 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from model.util import compute_image_level_kl
+from dataset.load_data import get_data
+
+
+def KL_Divergence_Query(model, ema_model, unlabeled_dataset, n):
+    """
+    Selects samples with the highest divergence between student and teacher models.
+    """
+    scores = []
+
+    model.eval()
+    ema_model.eval()
+
+    for idx in range(len(unlabeled_dataset.data_path)):
+        # Load sample data
+        img, _, _, _ = get_data(unlabeled_dataset.data_path[idx])
+        img = img.float().cuda()
+        
+        with torch.no_grad():
+            # Get logits for both student and teacher models
+            student_logits = model(img.unsqueeze(0))
+            teacher_logits = ema_model(img.unsqueeze(0))
+
+            # Calculate image-level KL divergence score
+            d_x = compute_image_level_kl(student_logits, teacher_logits)
+
+        scores.append(d_x.item())
+
+    scores = torch.tensor(scores)
+    # Select the top-n samples with the largest divergence (highest information gain)
+    selected = torch.argsort(scores, descending=True)[:n]
+    
+    return selected.cpu().numpy().tolist()
+
+
+def Query(model, ema_model, unlabeled_dataset, train_dataset,
+          patch_size, label_size, query_method, dropout=False):
+    """
+    Active Learning Query Wrapper.
+    Only KL method is retained based on requirements.
+    """
+    if query_method == 'KL':
+        return KL_Divergence_Query(model, ema_model, unlabeled_dataset, label_size)
+
+    raise ValueError(f'Query method {query_method} is not supported or was removed.')
