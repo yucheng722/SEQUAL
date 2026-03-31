@@ -14,73 +14,10 @@ PSE_DIR = os.path.join(BASE_DIR, "pseudo_labels")
 LIST_DIR = os.path.join(BASE_DIR, "file_lists")
 CF_DIR = os.path.join(BASE_DIR, "calibration")
 
-def create_splits():
-    """
-    Splits the dataset into Train, Test, Val, and Unlabeled pools based on criteria.
-    Ensures no overlap between cases.
-    """
-    train_txt = os.path.join(LIST_DIR, "train.txt")
-    if os.path.exists(train_txt):
-        return  
-
-    def read_list(filename):
-        filepath = os.path.join(LIST_DIR, filename)
-        if not os.path.exists(filepath):
-            return []
-        with open(filepath, 'r') as f:
-            return [line.strip() for line in f if line.strip()]
-
-    # Load predefined quality lists
-    list_3 = read_list("category_3.txt")
-    list_2 = read_list("category_2.txt")
-    list_1 = read_list("category_1.txt")
-    list_0 = read_list("category_0.txt")
-
-    # 1. Test Split: All from category 3 + sample from category 2
-    test_cases = list(list_3)
-    test_from_2 = random.sample(list_2, min(23, len(list_2)))
-    test_cases.extend(test_from_2)
-    list_2_rem = [c for c in list_2 if c not in test_from_2]
-
-    # 2. Train Split: Sample from category 1 and category 2
-    train_from_1 = random.sample(list_1, min(40, len(list_1)))
-    train_from_2 = random.sample(list_2_rem, min(10, len(list_2_rem)))
-    train_cases = train_from_1 + train_from_2
-
-    list_1_rem = [c for c in list_1 if c not in train_from_1]
-    list_2_rem = [c for c in list_2_rem if c not in train_from_2]
-
-    # 3. Unlabeled Split: Random selection from the remaining pool
-    pool_remaining = list_0 + list_1_rem + list_2_rem
-    unlabeled_cases = random.sample(pool_remaining, min(625, len(pool_remaining)))
-
-    # 4. Validation Split: Everything left in the pool
-    unlabeled_set = set(unlabeled_cases)
-    val_cases = [c for c in pool_remaining if c not in unlabeled_set]
-
-    templates = ['type_a', 'type_b', 'type_c']
-
-    def write_patches(cases, out_name):
-        with open(os.path.join(LIST_DIR, out_name), 'w') as f:
-            for case in cases:
-                for tmpl in templates:
-                    # Check for bilateral existence
-                    base_l = f"{case}_side_l_{tmpl}"
-                    base_r = f"{case}_side_r_{tmpl}"
-                    if os.path.exists(os.path.join(PATCH_DIR, f"{base_l}_img.png")):
-                        f.write(f"{base_l}\n")
-                    elif os.path.exists(os.path.join(PATCH_DIR, f"{base_r}_img.png")):
-                        f.write(f"{base_r}\n")
-
-    write_patches(train_cases, "train.txt")
-    write_patches(test_cases, "test.txt")
-    write_patches(unlabeled_cases, "unlabeled.txt")
-    write_patches(val_cases, "val.txt")
-
-    print(f"Data partitioning complete.")
-    print(f"Stats: Train={len(train_cases)}, Test={len(test_cases)}, Unlabeled={len(unlabeled_cases)}, Val={len(val_cases)}")
-
 def get_data(patch_name):
+    """
+    Reads image, mask and metadata for a specific patch.
+    """
     img_path = os.path.join(PATCH_DIR, f"{patch_name}_img.png")
     mask_path = os.path.join(PATCH_DIR, f"{patch_name}_mask.png")
 
@@ -113,8 +50,7 @@ class FullDataset(Dataset):
         self.transform = transform
         self.subset = subset
 
-        create_splits()
-
+        # Directly map subset to existing split files
         mapping = {
             'Train': 'train.txt',
             'Test': 'test.txt',
@@ -124,6 +60,9 @@ class FullDataset(Dataset):
         list_file = mapping.get(subset, 'train.txt')
         list_path = os.path.join(LIST_DIR, list_file)
         
+        if not os.path.exists(list_path):
+            raise FileNotFoundError(f"Split file not found: {list_path}")
+
         with open(list_path, 'r') as f:
             self.dir_list = [line.strip() for line in f if line.strip()]
 
