@@ -1,0 +1,145 @@
+import h5py
+import os
+import numpy as np
+import random
+import cv2
+
+def write_in_h5(h5_save_path, images, labels, label_alt1, label_alt2):
+    with h5py.File(h5_save_path, mode='w') as hf:
+        hf.create_dataset(name="image", dtype=float, data=images)
+        hf.create_dataset(name="label", dtype=float, data=np.array(labels).astype(bool).astype(int))
+        hf.create_dataset(name="label_alt1", dtype=float, data=np.array(label_alt1).astype(bool).astype(int))
+        hf.create_dataset(name="label_alt2", dtype=float, data=np.array(label_alt2).astype(bool).astype(int))
+    print(f"Saved: {h5_save_path}")
+
+def get_img_dim(data):
+    first_key = list(data.keys())[0]
+    first_patch = list(data[first_key]["img"].keys())[0]
+    return data[first_key]["img"][first_patch][()].shape + (1,)
+
+def get_keys(data, keys, pfold):
+    item_ids = []
+    with open(pfold) as f:
+        lines = [line.strip() for line in f.readlines()]
+    
+    target_names = []
+    for l in lines:
+        target_names.append(l + '_L.tiff')
+        target_names.append(l + '_R.tiff')
+        
+    for entry in target_names:
+        if entry in data.keys():
+            for patch_id in data[entry][keys[0]].keys():
+                item = [[entry], [patch_id]]
+                item_ids.append(item)
+    return item_ids
+
+def transform_label(label, method, iterations):
+    kernel = np.ones((3, 3), np.uint8)
+    if method == 'Erode':
+        result = cv2.erode(label, kernel, iterations=iterations)
+    elif method == 'Dilate':
+        # Default behavior for dilation
+        iters = random.choice([5, 6, 7, 8, 9])
+        result = cv2.dilate(label, kernel, iterations=iters)
+    else:
+        result = label
+    return result
+
+def get_weight_matrix(A, size):
+    eig_vals, eig_vecs = np.linalg.eig(A)
+    max_val = np.max(eig_vals)
+    idx = [i for i, v in enumerate(eig_vals) if v == max_val]
+    principal_vec = -eig_vecs[:, idx]
+    
+    w = np.zeros((size, 1), dtype=complex)
+    for i in range(size):
+        w[i] = principal_vec[i] / np.sum(principal_vec)
+    return w, max_val
+
+def consistency_check(max_eig, size):
+    ci = (max_eig - size) / (size - 1)
+    ri_table = [0, 0, 0.58, 0.9, 1.12, 1.24, 1.32, 1.41, 1.45, 1.49, 1.52, 1.54, 1.56, 1.58, 1.59]
+    cr = ci / ri_table[size - 1]
+    return cr
+
+if __name__ == '__main__':
+    # Configuration - Use relative paths or environment variables
+    BASE_DATA_DIR = os.getenv('DATA_PATH', './data/raw')
+    OUTPUT_DIR = os.getenv('OUT_PATH', './data/processed')
+    
+    path_a1 = os.path.join(BASE_DATA_DIR, 'source_v1.h5')
+    path_a1_bis = os.path.join(BASE_DATA_DIR, 'source_v1_bis.h5')
+    path_a2 = os.path.join(BASE_DATA_DIR, 'source_v2.h5')
+
+    train_split = os.path.join(BASE_DATA_DIR, 'splits/train.txt')
+    test_split = os.path.join(BASE_DATA_DIR, 'splits/test.txt')
+    unlabeled_split = os.path.join(BASE_DATA_DIR, 'splits/unlabeled.txt')
+
+    data_h5 = h5py.File(path_a1, 'r')
+    data_bis_h5 = h5py.File(path_a1_bis, 'r')
+    data_a2_h5 = h5py.File(path_a2, 'r')
+    
+    img_dim = get_img_dim(data_h5)
+    data_keys = ["img", "masks"]
+    
+    # Weight calculation matrix
+    comparison_matrix = [[1, 2, 1.5], [0.5, 1, 0.5], [1/1.5, 2, 1]]
+    num_features = 3
+    weights_complex, max_eigen = get_weight_matrix(comparison_matrix, num_features)
+    weights = weights_complex.real
+    cr_val = consistency_check(max_eigen, num_features)
+
+    all_train_keys = get_keys(data_h5, data_keys, train_split)
+    selected_train_keys = random.sample(all_train_keys, 150)
+    
+    all_unlabeled_keys = get_keys(data_h5, data_keys, unlabeled_split)
+    selected_unlabeled_keys = random.sample(all_unlabeled_keys, 1875)
+
+    data_types = ['train', 'test', 'unlabeled']
+    for d_type in data_types:
+        if d_type == 'train':
+            active_keys = selected_train_keys
+        elif d_type == 'test':
+            active_keys = get_keys(data_h5, data_keys, test_split)
+        else:
+            active_keys = selected_unlabeled_keys
+
+        for idx, item_id in enumerate(active_keys):
+            p_id = item_id[0][0]
+            s_id = item_id[1][0]
+            
+            # Load and process images
+            img_data = data_h5[p_id]['img'][s_id][()].reshape((img_dim[0], img_dim[1]))
+            
+            # Load and process masks
+            m1 = data_h5[p_id]['masks'][s_id][()].reshape((img_dim[0], img_dim[1])) / 255
+            m1_bis = data_bis_h5[p_id]['masks'][s_id][()].reshape((img_dim[0], img_dim[1])) / 255
+            m2 = data_a2_h5[p_id]['masks'][s_id][()].reshape((img_dim[0], img_dim[1])) / 255
+            
+            # Weighted ensemble
+            ensemble_map = weights[0] * m1 + weights[1] * m1_bis + weights[2] * m2
+            
+            # Binarization
+            final_label = (np.array(ensemble_map) + 0.5).astype(np.int16)
+            label_v1 = (np.array(m1) + 0.5).astype(np.int16)
+            label_v1_bis = (np.array(m1_bis) + 0.5).astype(np.int16)
+            label_v2 = (np.array(m2) + 0.5).astype(np.int16)
+            
+            # Export results to subdirectories
+            output_dirs = {
+                "main": "set_a",
+                "img": "set_img",
+                "v1": "set_v1",
+                "v1b": "set_v1_bis",
+                "v2": "set_v2"
+            }
+            
+            for key in output_dirs:
+                os.makedirs(os.path.join(OUTPUT_DIR, output_dirs[key]), exist_ok=True)
+
+            cv2.imwrite(os.path.join(OUTPUT_DIR, output_dirs["main"], f"{p_id}_{s_id}_A.png"), final_label * 255)
+            cv2.imwrite(os.path.join(OUTPUT_DIR, output_dirs["img"], f"{p_id}_{s_id}_Img.png"), img_data)
+            cv2.imwrite(os.path.join(OUTPUT_DIR, output_dirs["v1"], f"{p_id}_{s_id}_V1.png"), label_v1 * 255)
+            cv2.imwrite(os.path.join(OUTPUT_DIR, output_dirs["v1b"], f"{p_id}_{s_id}_V1B.png"), label_v1_bis * 255)
+            cv2.imwrite(os.path.join(OUTPUT_DIR, output_dirs["v2"], f"{p_id}_{s_id}_V2.png"), label_v2 * 255)
