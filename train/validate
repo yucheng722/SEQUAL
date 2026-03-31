@@ -1,0 +1,84 @@
+import numpy as np
+import torch
+from medpy import metric
+import surface_distance as surfdist
+
+from dataset.load_data import get_data
+from model.stopping_criteria import compute_batch_iou
+
+
+def validation(test_loader, model):
+    """
+    Evaluation suite for medical image segmentation performance.
+
+    Metrics:
+        - Dice Coefficient (DC)
+        - Intersection over Union (IoU)
+        - Average Surface Distance (ASD)
+        - 95th Percentile Hausdorff Distance (HD95)
+    """
+    dice_list = []
+    dice_sum = 0.0
+    iou_sum = 0.0
+    asd_sum = 0.0
+    hd_sum = 0.0
+
+    num_samples = len(test_loader.dataset.data_path)
+
+    model.eval()
+    with torch.no_grad():
+        for index in range(num_samples):
+            # Load input, ground truth, and physical metadata (spacing/calibration)
+            image, gt, _, spacing = get_data(test_loader.dataset.data_path[index])
+            image = image.float()
+
+            # Inference
+            logits = model(image.unsqueeze(0).cuda())
+            probs = torch.softmax(logits, dim=1)
+            pred = torch.argmax(probs, dim=1).squeeze(0).cpu().numpy()
+
+            gt_np = np.array(gt)
+
+            # 1. Overlap-based Metrics (Foreground)
+            dice = metric.binary.dc(pred == 1, gt_np == 1)
+            dice_sum += dice
+            dice_list.append(dice)
+
+            _, iou_fg = compute_batch_iou(pred, gt_np)
+            iou_sum += iou_fg
+
+            # 2. Distance-based Metrics (Surface Analysis)
+            # Convert to boolean for surface distance library processing
+            pred_mask = pred.astype(bool)
+            gt_mask = gt_np.astype(bool)
+
+            # Edge case handling: check for empty masks to avoid computation errors
+            is_gt_empty = not np.any(gt_mask)
+            is_pred_empty = not np.any(pred_mask)
+
+            if is_gt_empty or is_pred_empty:
+                asd = 0.0
+                hd95 = 0.0
+            else:
+                # Compute surface distance using physical spacing
+                surface_distances = surfdist.compute_surface_distances(
+                    gt_mask, pred_mask, spacing_mm=spacing
+                )
+
+                # Robust Hausdorff distance at 95th percentile
+                hd95 = surfdist.compute_robust_hausdorff(surface_distances, 95)
+
+                # Average Surface Distance (mean of symmetric distances)
+                avg_surf_dist = surfdist.compute_average_surface_distance(surface_distances)
+                asd = (avg_surf_dist[0] + avg_surf_dist[1]) / 2.0
+
+            asd_sum += asd
+            hd_sum += hd95
+
+    # Compute dataset-level averages
+    mean_dice = dice_sum / num_samples
+    mean_iou = iou_sum / num_samples
+    mean_asd = asd_sum / num_samples
+    mean_hd = hd_sum / num_samples
+
+    return mean_dice, mean_iou, mean_asd, mean_hd, dice_list
