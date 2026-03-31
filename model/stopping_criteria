@@ -1,0 +1,136 @@
+import numpy as np
+from scipy.optimize import curve_fit
+
+
+# =========================
+# Metric computation utilities
+# =========================
+
+def update_metric_stat(predict, gt, tp_list, p_list, t_list, num_classes=2):
+    """
+    Accumulate true positives, predicted positives, and ground-truth totals.
+    """
+    valid_mask = gt < 255
+    correct_mask = (predict == gt) & valid_mask
+
+    for i in range(num_classes):
+        p_list[i] += np.sum((predict == i) & valid_mask)
+        t_list[i] += np.sum((gt == i) & valid_mask)
+        tp_list[i] += np.sum((gt == i) & correct_mask)
+
+    return tp_list, p_list, t_list
+
+
+def compute_iou_from_stats(tp_list, p_list, t_list, num_classes=2):
+    """
+    Calculate IoU for each class from accumulated statistics.
+    """
+    return [
+        tp_list[i] / (t_list[i] + p_list[i] - tp_list[i] + 1e-10)
+        for i in range(num_classes)
+    ]
+
+
+def compute_batch_iou(predict, gt, num_classes=2):
+    """
+    Calculate IoU for a single batch.
+    """
+    tp_list = [0] * num_classes
+    p_list = [0] * num_classes
+    t_list = [0] * num_classes
+
+    valid_mask = gt < 255
+    correct_mask = (predict == gt) & valid_mask
+
+    for i in range(num_classes):
+        p_list[i] += np.sum((predict == i) & valid_mask)
+        t_list[i] += np.sum((gt == i) & valid_mask)
+        tp_list[i] += np.sum((gt == i) & correct_mask)
+
+    iou = [
+        tp_list[i] / (t_list[i] + p_list[i] - tp_list[i] + 1e-10)
+        for i in range(num_classes)
+    ]
+    return iou[0], iou[1]
+
+
+# =========================
+# Curve fitting utilities
+# =========================
+
+def saturating_growth_func(x, a, b, c):
+    """
+    Model function for trend fitting (Growth curve).
+    Formula: a * (1 - exp(-x^b / c))
+    """
+    return a * (1 - np.exp(-x ** b / c))
+
+
+def fit_trend_curve(x_data, y_data):
+    """
+    Perform curve fitting using bounded Trust Region Reflective algorithm.
+    """
+    # Initial guess: (asymptote, power, scale)
+    initial_guess = (max(y_data), 1.0, float(len(y_data)))
+    
+    # Parameter constraints:
+    # 'a' is bounded by 100.001 assuming y represents a percentage (0-100)
+    lower_bounds = [0.0, 0.0, 0.0]
+    upper_bounds = [100.001, np.inf, np.inf]
+    
+    params, _ = curve_fit(
+        saturating_growth_func,
+        x_data,
+        y_data,
+        p0=initial_guess,
+        method='trf',
+        bounds=(lower_bounds, upper_bounds),
+        maxfev=10000
+    )
+    return params
+
+
+# =========================
+# Analysis & Decision Logic
+# =========================
+
+def get_curve_acceleration(x, a, b, c):
+    """
+    Calculate the second-order derivative (acceleration) of the trend curve.
+    """
+    x = x + 1e-6  # Prevent division by zero
+    
+    coeff = (a * b) / c
+    exp_component = np.exp(-(x ** b) / c)
+    inner_term = (b - 1) * (x ** (b - 2)) - (b / c) * (x ** (2 * b - 2))
+
+    return coeff * exp_component * inner_term
+
+
+def check_convergence_criterion(history, current_step, threshold):
+    """
+    Evaluate if the process has reached a stable state based on 
+    the acceleration of the fitted metric curve.
+    """
+    # Build time sequence
+    steps = np.arange(1, current_step + 2)
+    
+    # Fit curve to history
+    try:
+        a, b, c = fit_trend_curve(steps, history)
+        # Compute acceleration at current step
+        acc = get_curve_acceleration(current_step, a, b, c)
+        
+        # Trigger update if acceleration magnitude falls below threshold
+        is_converged = abs(acc) < threshold
+        return is_converged, abs(acc)
+    except Exception:
+        # Fallback if curve fitting fails to converge
+        return False, 0.0
+
+
+def eval_update_trigger(history, current_step, threshold):
+    """
+    Decision wrapper for process updates.
+    """
+    return check_convergence_criterion(history, current_step, threshold)
